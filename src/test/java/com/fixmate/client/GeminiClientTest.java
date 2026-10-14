@@ -20,12 +20,14 @@ import static org.springframework.test.web.client.response.MockRestResponseCreat
 class GeminiClientTest {
     ObjectMapper mapper = new ObjectMapper();
     MockRestServiceServer server;
+    RestClient restClient;
     GeminiClient client;
     List<String> categories = List.of("Plumbing", "Electrical", "Laptop Repair", "Other");
     @BeforeEach void setup() {
         var builder = RestClient.builder().baseUrl("https://generativelanguage.googleapis.com/v1beta");
         server = MockRestServiceServer.bindTo(builder).build();
-        client = new GeminiClient(builder.build(), mapper, "test-key", "test-model");
+        restClient = builder.build();
+        client = new GeminiClient(restClient, mapper, "test-key", "test-model", "gemini-3.6-flash");
     }
     Map<String,Object> fixture(boolean diy) {
         var result = new LinkedHashMap<String,Object>();
@@ -46,7 +48,7 @@ class GeminiClientTest {
                 .andExpect(jsonPath("$.generationConfig.responseFormat.text.mimeType").value("APPLICATION_JSON"))
                 .andRespond(withSuccess(envelope(result), MediaType.APPLICATION_JSON));
     }
-    @Test void validStructuredDiyResponse() throws Exception {
+    @Test void validStructuredDiyResponseUsesPrimaryWithoutFallback() throws Exception {
         respond(fixture(true)); var result = client.analyze("Tap is dripping", "Other", categories);
         assertTrue(result.canSelfFix()); assertFalse(result.technicianRequired()); assertEquals("Plumbing", result.predictedCategory()); server.verify();
     }
@@ -97,7 +99,7 @@ class GeminiClientTest {
         } finally { logger.detachAppender(logs); logs.stop(); }
     }
     @Test void missingKeyFailsWithoutNetworkCall() {
-        var absent = new GeminiClient(RestClient.create(), mapper, "", "test-model");
+        var absent = new GeminiClient(RestClient.create(), mapper, "", "test-model", "gemini-3.6-flash");
         assertThrows(GeminiClient.AIServiceUnavailableException.class, () -> absent.analyze("Tap", "Other", categories)); server.verify();
     }
     @Test void invalidKeyHandled() {
@@ -106,10 +108,12 @@ class GeminiClientTest {
     }
     @Test void rateLimitHandled() {
         server.expect(anything()).andRespond(withStatus(HttpStatus.TOO_MANY_REQUESTS));
+        server.expect(requestTo(fallbackUrl())).andRespond(withStatus(HttpStatus.TOO_MANY_REQUESTS));
         assertThrows(GeminiClient.AIServiceUnavailableException.class, () -> client.analyze("Tap", "Other", categories));
     }
     @Test void serverErrorHandled() {
         server.expect(anything()).andRespond(withServerError());
+        server.expect(requestTo(fallbackUrl())).andRespond(withServerError());
         assertThrows(GeminiClient.AIServiceUnavailableException.class, () -> client.analyze("Tap", "Other", categories));
     }
     @Test void timeoutHandled() {
@@ -189,7 +193,7 @@ class GeminiClientTest {
             server.expect(anything()).andRespond(withStatus(HttpStatus.BAD_REQUEST).contentType(MediaType.APPLICATION_JSON).body(body));
             var exception = assertThrows(GeminiClient.AIServiceUnavailableException.class, () -> client.analyze("Tap", "Other", categories));
             assertEquals("Gemini is temporarily unavailable", exception.getMessage()); assertNull(exception.getCause());
-            String logged = logs.list.get(0).getFormattedMessage();
+            String logged = logs.list.stream().map(ILoggingEvent::getFormattedMessage).filter(m -> m.contains("Gemini provider failure")).findFirst().orElseThrow();
             assertTrue(logged.contains("model=test-model")); assertTrue(logged.contains("httpStatus=400"));
             assertTrue(logged.contains("providerCode=400")); assertTrue(logged.contains("providerStatus=INVALID_ARGUMENT"));
             assertTrue(logged.contains("Unsupported response schema")); assertTrue(logged.contains("[REDACTED]"));
@@ -207,10 +211,13 @@ class GeminiClientTest {
                 server.reset(); logs.list.clear();
                 String body = mapper.writeValueAsString(Map.of("error", Map.of("code", status.value(), "status", status.name(), "message", "Provider diagnostic")));
                 server.expect(anything()).andRespond(withStatus(status).contentType(MediaType.APPLICATION_JSON).body(body));
+                if (status == HttpStatus.INTERNAL_SERVER_ERROR || status == HttpStatus.TOO_MANY_REQUESTS)
+                    server.expect(requestTo(fallbackUrl())).andRespond(withStatus(status).contentType(MediaType.APPLICATION_JSON).body(body));
                 var exception = assertThrows(GeminiClient.AIServiceUnavailableException.class, () -> client.analyze("Tap", "Other", categories));
                 assertEquals("Gemini is temporarily unavailable", exception.getMessage());
-                assertTrue(logs.list.get(0).getFormattedMessage().contains("httpStatus=" + status.value()));
-                assertTrue(logs.list.get(0).getFormattedMessage().contains("providerStatus=" + status.name()));
+                assertTrue(logs.list.stream().anyMatch(e -> e.getFormattedMessage().contains("httpStatus=" + status.value())));
+                assertTrue(logs.list.stream().anyMatch(e -> e.getFormattedMessage().contains("providerStatus=" + status.name())));
+                server.verify();
             }
         } finally { logger.detachAppender(logs); logs.stop(); }
     }
@@ -220,11 +227,128 @@ class GeminiClientTest {
         var logs = new ListAppender<ILoggingEvent>(); logs.start(); logger.addAppender(logs);
         try {
             server.expect(anything()).andRespond(withServerError().body("<html>test-key private request body</html>"));
+            server.expect(requestTo(fallbackUrl())).andRespond(withServerError().body("<html>test-key private request body</html>"));
             assertThrows(GeminiClient.AIServiceUnavailableException.class, () -> client.analyze("Tap", "Other", categories));
-            String logged = logs.list.get(0).getFormattedMessage();
+            String logged = logs.list.stream().map(ILoggingEvent::getFormattedMessage).filter(m -> m.contains("Gemini provider failure")).findFirst().orElseThrow();
             assertTrue(logged.contains("httpStatus=500")); assertTrue(logged.contains("unreadable error body"));
             assertFalse(logged.contains("test-key")); assertFalse(logged.contains("private request body"));
         } finally { logger.detachAppender(logs); logs.stop(); }
+    }
+
+    String fallbackUrl() { return "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:generateContent"; }
+
+    void productionModels() {
+        client = new GeminiClient(restClient, mapper, "test-key", "gemini-3.8-flash", "gemini-3.6-flash");
+    }
+
+    String primaryUrl() { return "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash:generateContent"; }
+
+    Map<String, Object> laptopFixture(boolean diy) {
+        var result = fixture(diy);
+        result.put("category", "Laptop Repair"); result.put("serviceCategory", "Laptop Repair");
+        result.put("problemSummary", "Slight laptop warmth during normal use");
+        result.put("possibleCauses", List.of("Normal processor workload"));
+        result.put("troubleshootingSteps", List.of("Close unused browser tabs", "Use a hard flat surface and keep vents clear"));
+        return result;
+    }
+
+    @Test void primary503FallsBackOnceWithIdenticalStructuredRequest() throws Exception {
+        productionModels();
+        var bodies = new ArrayList<String>();
+        server.expect(requestTo(primaryUrl())).andExpect(header("x-goog-api-key", "test-key"))
+                .andExpect(request -> bodies.add(((org.springframework.mock.http.client.MockClientHttpRequest) request).getBodyAsString()))
+                .andRespond(withStatus(HttpStatus.SERVICE_UNAVAILABLE));
+        server.expect(requestTo(fallbackUrl())).andExpect(header("x-goog-api-key", "test-key"))
+                .andExpect(request -> bodies.add(((org.springframework.mock.http.client.MockClientHttpRequest) request).getBodyAsString()))
+                .andRespond(withSuccess(envelope(laptopFixture(true)), MediaType.APPLICATION_JSON));
+        var result = client.analyze("My laptop becomes slightly warm while using many browser tabs, but otherwise it works normally.", "Other", categories);
+        assertTrue(result.canSelfFix()); assertFalse(result.technicianRequired());
+        assertEquals("Laptop Repair", result.recommendedService());
+        assertEquals(2, bodies.size()); assertEquals(mapper.readTree(bodies.get(0)), mapper.readTree(bodies.get(1)));
+        server.verify();
+    }
+
+    @Test void primary429FallsBackAndLogsActualSuccessfulModel() throws Exception {
+        productionModels();
+        Logger logger = (Logger) LoggerFactory.getLogger(GeminiClient.class);
+        var logs = new ListAppender<ILoggingEvent>(); logs.start(); logger.addAppender(logs);
+        try {
+            server.expect(requestTo(primaryUrl())).andRespond(withStatus(HttpStatus.TOO_MANY_REQUESTS));
+            server.expect(requestTo(fallbackUrl())).andRespond(withSuccess(envelope(laptopFixture(true)), MediaType.APPLICATION_JSON));
+            assertTrue(client.analyze("Slight laptop warmth", "Other", categories).canSelfFix());
+            String logged = logs.list.stream().map(ILoggingEvent::getFormattedMessage).reduce("", (a, b) -> a + b);
+            assertTrue(logged.contains("Gemini primary failure: model=gemini-3.8-flash, status=429"));
+            assertTrue(logged.contains("Gemini fallback attempt: model=gemini-3.6-flash"));
+            assertTrue(logged.contains("Gemini fallback success: model=gemini-3.6-flash"));
+            assertFalse(logged.contains("test-key")); server.verify();
+        } finally { logger.detachAppender(logs); logs.stop(); }
+    }
+
+    @Test void otherAllowedTransientStatusesUseOneFallback() throws Exception {
+        productionModels();
+        for (HttpStatus status : List.of(HttpStatus.INTERNAL_SERVER_ERROR, HttpStatus.BAD_GATEWAY, HttpStatus.GATEWAY_TIMEOUT)) {
+            server.reset();
+            server.expect(requestTo(primaryUrl())).andRespond(withStatus(status));
+            server.expect(requestTo(fallbackUrl())).andRespond(withSuccess(envelope(laptopFixture(true)), MediaType.APPLICATION_JSON));
+            assertTrue(client.analyze("Slight laptop warmth", "Other", categories).canSelfFix()); server.verify();
+        }
+    }
+
+    @Test void authPermissionRequestAndValidationFailuresNeverFallBack() {
+        productionModels();
+        for (HttpStatus status : List.of(HttpStatus.BAD_REQUEST, HttpStatus.UNAUTHORIZED, HttpStatus.FORBIDDEN,
+                HttpStatus.NOT_FOUND, HttpStatus.UNPROCESSABLE_ENTITY)) {
+            server.reset(); server.expect(requestTo(primaryUrl())).andRespond(withStatus(status));
+            assertThrows(GeminiClient.AIServiceUnavailableException.class, () -> client.analyze("Laptop issue", "Other", categories));
+            server.verify(); // Any fallback would be an unexpected request and fail the test.
+        }
+    }
+
+    @Test void explicitPermissionErrorWrappedIn503DoesNotFallBack() throws Exception {
+        productionModels();
+        server.expect(requestTo(primaryUrl())).andRespond(withStatus(HttpStatus.SERVICE_UNAVAILABLE)
+                .contentType(MediaType.APPLICATION_JSON)
+                .body(mapper.writeValueAsString(Map.of("error", Map.of("code", 403, "status", "PERMISSION_DENIED", "message", "Denied")))));
+        assertThrows(GeminiClient.AIServiceUnavailableException.class, () -> client.analyze("Laptop issue", "Other", categories));
+        server.verify();
+    }
+
+    @Test void bothModelsFailWithCleanExceptionAndNoThirdAttempt() {
+        productionModels();
+        server.expect(requestTo(primaryUrl())).andRespond(withStatus(HttpStatus.SERVICE_UNAVAILABLE));
+        server.expect(requestTo(fallbackUrl())).andRespond(withStatus(HttpStatus.SERVICE_UNAVAILABLE).body("Private provider error"));
+        var error = assertThrows(GeminiClient.AIServiceUnavailableException.class, () -> client.analyze("Laptop issue", "Other", categories));
+        assertEquals("Gemini is temporarily unavailable", error.getMessage()); assertNull(error.getCause()); server.verify();
+    }
+
+    @Test void malformedFallbackIsFailureRatherThanSuccessfulAnalysis() throws Exception {
+        productionModels(); var result = laptopFixture(true); result.put("technicianRequired", true);
+        server.expect(requestTo(primaryUrl())).andRespond(withStatus(HttpStatus.SERVICE_UNAVAILABLE));
+        server.expect(requestTo(fallbackUrl())).andRespond(withSuccess(envelope(result), MediaType.APPLICATION_JSON));
+        assertThrows(GeminiClient.AIServiceUnavailableException.class, () -> client.analyze("Laptop issue", "Other", categories));
+        server.verify();
+    }
+
+    @Test void swollenBatterySafetyOverridesUnsafeFallbackAdvice() throws Exception {
+        productionModels(); var result = laptopFixture(true);
+        result.put("troubleshootingSteps", List.of("Open the battery and puncture it"));
+        server.expect(requestTo(primaryUrl())).andRespond(withStatus(HttpStatus.SERVICE_UNAVAILABLE));
+        server.expect(requestTo(fallbackUrl())).andRespond(withSuccess(envelope(result), MediaType.APPLICATION_JSON));
+        var safe = client.analyze("My laptop battery is swollen and the bottom case is bulging.", "Other", categories);
+        assertTrue(safe.technicianRequired()); assertFalse(safe.canSelfFix()); assertEquals("HIGH", safe.priority());
+        assertEquals("Laptop Repair", safe.recommendedService());
+        assertEquals(List.of("Stop using the affected item and keep a safe distance.",
+                "Contact a qualified technician; seek local emergency help if there is immediate danger."), safe.troubleshootingSteps());
+        server.verify();
+    }
+
+    @Test void imageInputIsPreservedOnFallback() throws Exception {
+        productionModels();
+        server.expect(requestTo(primaryUrl())).andRespond(withStatus(HttpStatus.SERVICE_UNAVAILABLE));
+        server.expect(requestTo(fallbackUrl())).andExpect(jsonPath("$.contents[0].parts[1].inline_data.data").value("AQID"))
+                .andRespond(withSuccess(envelope(laptopFixture(false)), MediaType.APPLICATION_JSON));
+        assertEquals("ANALYZED", client.analyzeImage("Laptop issue", "Other", categories, new ByteArrayResource(new byte[]{1,2,3}), "image/png").imageAnalysisStatus());
+        server.verify();
     }
 
     void respondText(String text) throws Exception {

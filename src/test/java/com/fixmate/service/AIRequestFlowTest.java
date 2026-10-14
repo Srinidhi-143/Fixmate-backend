@@ -14,6 +14,12 @@ import java.util.*;
 import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.ArgumentMatchers.*;
 import static org.mockito.Mockito.*;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import org.springframework.web.client.RestClient;
+import org.springframework.test.web.client.MockRestServiceServer;
+import org.springframework.http.HttpStatus;
+import static org.springframework.test.web.client.match.MockRestRequestMatchers.requestTo;
+import static org.springframework.test.web.client.response.MockRestResponseCreators.withStatus;
 
 @ExtendWith(MockitoExtension.class)
 class AIRequestFlowTest {
@@ -72,5 +78,21 @@ class AIRequestFlowTest {
         var saved = ArgumentCaptor.forClass(AIAnalysis.class); verify(analyses).save(saved.capture());
         assertTrue(saved.getValue().getTechnicianRequired()); assertFalse(saved.getValue().getCanSelfFix());
         assertEquals("GEMINI", saved.getValue().getSource());
+    }
+
+    @Test void bothActualClientAttemptsFailButServiceStillSavesRequestWithoutAi() {
+        setup();
+        var builder = RestClient.builder().baseUrl("https://generativelanguage.googleapis.com/v1beta");
+        var server = MockRestServiceServer.bindTo(builder).build();
+        var actualClient = new GeminiClient(builder.build(), new ObjectMapper(), "test-key", "gemini-3.8-flash", "gemini-3.6-flash");
+        ReflectionTestUtils.setField(service, "aiServiceClient", actualClient);
+        server.expect(requestTo("https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash:generateContent"))
+                .andRespond(withStatus(HttpStatus.SERVICE_UNAVAILABLE));
+        server.expect(requestTo("https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:generateContent"))
+                .andRespond(withStatus(HttpStatus.SERVICE_UNAVAILABLE));
+        var result = service.createRequest("customer@example.test", payload(), null);
+        assertEquals(10L, result.requestId()); assertEquals(RequestStatus.PENDING, result.status());
+        assertNull(result.aiAnalysis()); assertNull(result.aiAnalysisId());
+        verify(requests).save(any()); verifyNoInteractions(analyses); server.verify();
     }
 }
