@@ -53,4 +53,17 @@ class BookingServiceTest {
         when(providers.findByUser_Id(null)).thenReturn(Optional.of(provider));
         assertThrows(AccessDeniedException.class, () -> service.updateStatus(10L, "provider@example.test", UserRole.PROVIDER, RequestStatus.ACCEPTED));
     }
+    @Test void bookedProviderProgressesAndNotifiesCustomerAtEachStage() {
+        request.bookProvider(provider);
+        when(users.findByEmail("provider@example.test")).thenReturn(Optional.of(provider.getUser()));
+        when(providers.findByUser_Id(null)).thenReturn(Optional.of(provider));
+        for (RequestStatus status : List.of(RequestStatus.ACCEPTED, RequestStatus.IN_PROGRESS, RequestStatus.COMPLETED))
+            assertEquals(status, service.updateStatus(10L, "provider@example.test", UserRole.PROVIDER, status).status());
+        assertEquals(1, provider.getCompletedJobs());
+        verify(notifications).notifyRequestOwner(eq(request), eq(NotificationType.PROVIDER_ACCEPTED_REQUEST), anyString(), anyString());
+        verify(notifications).notifyRequestOwner(eq(request), eq(NotificationType.SERVICE_STARTED), anyString(), anyString());
+        verify(notifications).notifyRequestOwner(eq(request), eq(NotificationType.SERVICE_COMPLETED), anyString(), anyString());
+        assertThrows(IllegalArgumentException.class, () -> service.updateStatus(10L, "provider@example.test", UserRole.PROVIDER, RequestStatus.COMPLETED));
+        assertEquals(1, provider.getCompletedJobs());
+    }
 }

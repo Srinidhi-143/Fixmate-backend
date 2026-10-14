@@ -3,6 +3,7 @@ package com.fixmate.client;
 import com.fasterxml.jackson.databind.*;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.fixmate.dto.AIAnalysisResponse;
+import com.fixmate.util.ServiceCategoryNormalizer;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.core.io.Resource;
 import org.springframework.http.MediaType;
@@ -18,7 +19,8 @@ public class GeminiClient {
     private final ObjectMapper mapper;
     private final String key;
     private final String model;
-    private static final Pattern HAZARD = Pattern.compile("(?i)\\b(electric(?:al|ity)?|wiring|gas|fire|smoke|sparks?|sparking|swollen|high voltage|brakes?|engine|fuel|steering|mechanical)\\b");
+    private static final Pattern HAZARD = Pattern.compile("(?i)\\b(electric(?:al|ity)?|wiring|mains|gas|fire|smoke|sparks?|sparking|swollen|bulging|high[ -]voltage|brakes?|braking|engine|fuel|steering|mechanical)\\b");
+    private static final Pattern UNSAFE_ADVICE = Pattern.compile("(?i)\\b(punctur\\w*|bypass\\w*|disassemble|disassembling|dismantle|dismantling|short[ -]circuit\\w*)\\b|\\b(open|cut|repair|remove|touch|handle)\\b.{0,60}\\b(battery|batteries|live|powered|voltage|gas|mains)\\b");
 
     public GeminiClient(RestClient geminiRestClient, ObjectMapper mapper,
             @Value("${app.gemini.api-key:}") String key,
@@ -67,9 +69,11 @@ public class GeminiClient {
             StringBuilder text = new StringBuilder();
             for (var part : envelope.path("candidates").path(0).path("content").path("parts"))
                 if (!part.path("thought").asBoolean(false) && part.has("text")) text.append(part.path("text").asText());
-            JsonNode result = mapper.readTree(text.toString());
+            JsonNode result = parseResult(text.toString());
+            normalizeCategories(result, categories);
             validate(result, categories);
-            boolean danger = HAZARD.matcher(description + " " + result.path("category").asText() + " " + result.path("problemSummary").asText()).find()
+            boolean danger = HAZARD.matcher(description + " " + category + " " + result.path("category").asText() + " " + result.path("problemSummary").asText()).find()
+                    || UNSAFE_ADVICE.matcher(result.toString()).find()
                     || Set.of("HIGH", "URGENT").contains(result.path("severity").asText());
             var steps = strings(result.path("troubleshootingSteps"));
             String warning = result.path("safetyWarning").asText();
@@ -77,13 +81,45 @@ public class GeminiClient {
                 steps = List.of("Stop using the affected item and keep a safe distance.", "Contact a qualified technician; seek local emergency help if there is immediate danger.");
                 warning = "Professional repair is required. Do not attempt electrical, gas, battery or dangerous mechanical work yourself.";
             }
-            return new AIAnalysisResponse(result.path("category").asText(), result.path("problemSummary").asText(), steps,
-                    result.path("serviceCategory").asText(), warning, result.path("severity").asText(), result.path("confidence").asDouble(),
+            String summary = result.path("problemSummary").asText();
+            var causes = strings(result.path("possibleCauses"));
+            if (danger && UNSAFE_ADVICE.matcher(summary).find()) summary = "This issue requires assessment by a qualified technician.";
+            if (danger && UNSAFE_ADVICE.matcher(causes.toString()).find()) causes = List.of("A potentially hazardous fault requires professional assessment.");
+            return new AIAnalysisResponse(result.path("category").asText(), summary, steps,
+                    result.path("serviceCategory").asText(), warning,
+                    danger && !"URGENT".equals(result.path("severity").asText()) ? "HIGH" : result.path("severity").asText(), result.path("confidence").asDouble(),
                     image == null ? "NOT_PROVIDED" : "ANALYZED", danger ? false : result.path("canSelfFix").asBoolean(),
-                    danger ? true : result.path("technicianRequired").asBoolean(), strings(result.path("possibleCauses")));
+                    danger ? true : result.path("technicianRequired").asBoolean(), causes);
         } catch (AIServiceUnavailableException exception) { throw exception; }
         catch (RestClientException exception) { throw new AIServiceUnavailableException("Gemini is temporarily unavailable"); }
         catch (Exception exception) { throw new AIServiceUnavailableException("Gemini returned an invalid analysis"); }
+    }
+
+    private JsonNode parseResult(String text) throws Exception {
+        String json = text.trim();
+        if (json.startsWith("```")) {
+            var fence = Pattern.compile("\\A```(?:json)?\\s*\\R([\\s\\S]*?)\\R```\\s*\\z", Pattern.CASE_INSENSITIVE).matcher(json);
+            if (!fence.matches()) throw new AIServiceUnavailableException("Gemini returned an invalid analysis");
+            json = fence.group(1).trim();
+        }
+        // Reject trailing prose, a second JSON value, and duplicate decision fields.
+        try (var parser = mapper.getFactory().createParser(json)) {
+            parser.enable(com.fasterxml.jackson.core.JsonParser.Feature.STRICT_DUPLICATE_DETECTION);
+            JsonNode result = mapper.readTree(parser);
+            if (parser.nextToken() != null) throw new AIServiceUnavailableException("Gemini returned an invalid analysis");
+            return result;
+        }
+    }
+
+    private void normalizeCategories(JsonNode result, List<String> categories) {
+        if (!(result instanceof ObjectNode object)) return;
+        for (String field : List.of("category", "serviceCategory")) {
+            if (!object.path(field).isTextual()) continue;
+            String resolved = ServiceCategoryNormalizer.resolve(object.path(field).asText(), categories);
+            if (resolved != null) object.put(field, resolved);
+        }
+        // Keep the existing priority enum and database column unchanged.
+        if ("MEDIUM".equals(object.path("severity").asText())) object.put("severity", "NORMAL");
     }
 
     private void validate(JsonNode r, List<String> categories) {

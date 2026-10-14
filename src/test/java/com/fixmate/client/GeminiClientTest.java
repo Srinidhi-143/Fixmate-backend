@@ -113,4 +113,65 @@ class GeminiClientTest {
                 .andRespond(withSuccess(envelope(fixture(false)), MediaType.APPLICATION_JSON));
         assertEquals("ANALYZED", client.analyzeImage("Tap problem", "Other", categories, new ByteArrayResource(new byte[]{1,2,3}), "image/png").imageAnalysisStatus());
     }
+
+    @Test void mildLaptopWarmthCanRemainDiy() throws Exception {
+        var result = fixture(true);
+        result.put("category", "Laptop Repair"); result.put("serviceCategory", "Laptop Repair");
+        result.put("problemSummary", "Slight warmth during normal laptop use");
+        result.put("troubleshootingSteps", List.of("Close unused browser tabs", "Use a hard flat surface and keep vents clear"));
+        respond(result);
+        assertTrue(client.analyze("My laptop becomes slightly warm when I use many browser tabs, but otherwise it works normally.", "Other", categories).canSelfFix());
+    }
+
+    @Test void aliasesResolveToExistingCategoryAndMediumToNormal() throws Exception {
+        var result = fixture(false);
+        result.put("category", "Computer Repair"); result.put("serviceCategory", " laptop service ");
+        result.put("severity", "MEDIUM"); respond(result);
+        var analysis = client.analyze("Laptop will not start", "Other", categories);
+        assertEquals("Laptop Repair", analysis.predictedCategory());
+        assertEquals("Laptop Repair", analysis.recommendedService()); assertEquals("NORMAL", analysis.priority());
+    }
+
+    @Test void wholeJsonCodeFenceAccepted() throws Exception {
+        respondText("```json\n" + mapper.writeValueAsString(fixture(true)) + "\n```");
+        assertTrue(client.analyze("Tap is dripping", "Other", categories).canSelfFix());
+    }
+
+    @Test void trailingContentAndDuplicateFieldsRejected() throws Exception {
+        for (String json : List.of(mapper.writeValueAsString(fixture(true)) + " {}",
+                mapper.writeValueAsString(fixture(true)).replace("\"canSelfFix\":true", "\"canSelfFix\":true,\"canSelfFix\":false"),
+                "Explanation\n```json\n" + mapper.writeValueAsString(fixture(true)) + "\n```")) {
+            server.reset(); respondText(json);
+            assertThrows(GeminiClient.AIServiceUnavailableException.class, () -> client.analyze("Tap", "Other", categories));
+        }
+    }
+
+    @Test void dangerousAdviceOverridesBenignDescriptionAndSanitizesAllAdviceFields() throws Exception {
+        var result = fixture(true);
+        result.put("problemSummary", "Open the powered equipment to repair it");
+        result.put("possibleCauses", List.of("Remove the battery and puncture it"));
+        result.put("troubleshootingSteps", List.of("Bypass the safety switch")); respond(result);
+        var analysis = client.analyze("An item does not work", "Other", categories);
+        assertTrue(analysis.technicianRequired()); assertFalse(analysis.canSelfFix());
+        assertFalse(analysis.possibleProblem().contains("Open"));
+        assertFalse(analysis.possibleCauses().toString().contains("puncture"));
+        assertFalse(analysis.troubleshootingSteps().toString().contains("Bypass"));
+    }
+
+    @Test void nullAndWrongFieldTypesRejected() throws Exception {
+        for (Object value : Arrays.asList(null, "true", 1)) {
+            server.reset(); var result = fixture(true); result.put("canSelfFix", value); respond(result);
+            assertThrows(GeminiClient.AIServiceUnavailableException.class, () -> client.analyze("Tap", "Other", categories));
+        }
+    }
+
+    @Test void incompleteCandidateRejected() throws Exception {
+        server.expect(anything()).andRespond(withSuccess(envelope(fixture(true)).replace("STOP", "MAX_TOKENS"), MediaType.APPLICATION_JSON));
+        assertThrows(GeminiClient.AIServiceUnavailableException.class, () -> client.analyze("Tap", "Other", categories));
+    }
+
+    void respondText(String text) throws Exception {
+        var body = Map.of("candidates", List.of(Map.of("finishReason", "STOP", "content", Map.of("parts", List.of(Map.of("text", text))))));
+        server.expect(anything()).andRespond(withSuccess(mapper.writeValueAsString(body), MediaType.APPLICATION_JSON));
+    }
 }
