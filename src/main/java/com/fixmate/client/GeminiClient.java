@@ -4,17 +4,21 @@ import com.fasterxml.jackson.databind.*;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.fixmate.dto.AIAnalysisResponse;
 import com.fixmate.util.ServiceCategoryNormalizer;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.core.io.Resource;
 import org.springframework.http.MediaType;
 import org.springframework.stereotype.Component;
 import org.springframework.web.client.RestClient;
 import org.springframework.web.client.RestClientException;
+import org.springframework.web.client.RestClientResponseException;
 import java.util.*;
 import java.util.regex.Pattern;
 
 @Component
 public class GeminiClient {
+    private static final Logger LOGGER = LoggerFactory.getLogger(GeminiClient.class);
     private final RestClient client;
     private final ObjectMapper mapper;
     private final String key;
@@ -36,8 +40,14 @@ public class GeminiClient {
     }
 
     private AIAnalysisResponse generate(String description, String category, List<String> categories, Resource image, String type) {
-        if (key.isBlank() || model.isBlank()) throw new AIServiceUnavailableException("Gemini is not configured");
-        if (!model.matches("[A-Za-z0-9._-]+")) throw new AIServiceUnavailableException("Invalid Gemini model configuration");
+        if (key.isBlank() || model.isBlank()) {
+            LOGGER.warn("Gemini configuration missing: model={}, keyConfigured={}", redact(model), !key.isBlank());
+            throw new AIServiceUnavailableException("Gemini is not configured");
+        }
+        if (!model.matches("[A-Za-z0-9._-]+")) {
+            LOGGER.warn("Gemini model configuration invalid: model={}", redact(model));
+            throw new AIServiceUnavailableException("Invalid Gemini model configuration");
+        }
         try {
             ObjectNode schema = (ObjectNode) mapper.readTree("""
                 {"type":"object","properties":{
@@ -90,9 +100,46 @@ public class GeminiClient {
                     danger && !"URGENT".equals(result.path("severity").asText()) ? "HIGH" : result.path("severity").asText(), result.path("confidence").asDouble(),
                     image == null ? "NOT_PROVIDED" : "ANALYZED", danger ? false : result.path("canSelfFix").asBoolean(),
                     danger ? true : result.path("technicianRequired").asBoolean(), causes);
-        } catch (AIServiceUnavailableException exception) { throw exception; }
-        catch (RestClientException exception) { throw new AIServiceUnavailableException("Gemini is temporarily unavailable"); }
-        catch (Exception exception) { throw new AIServiceUnavailableException("Gemini returned an invalid analysis"); }
+        } catch (AIServiceUnavailableException exception) {
+            LOGGER.warn("Gemini analysis rejected: model={}, reason={}", redact(model), redact(exception.getMessage()));
+            throw exception;
+        } catch (RestClientResponseException exception) {
+            logProviderError(exception);
+            throw new AIServiceUnavailableException("Gemini is temporarily unavailable");
+        } catch (RestClientException exception) {
+            Throwable cause = exception.getMostSpecificCause();
+            String phase = cause instanceof com.fasterxml.jackson.core.JsonProcessingException
+                    ? "response parsing failure" : "transport failure";
+            LOGGER.warn("Gemini {}: model={}, cause={}", phase, redact(model), cause.getClass().getSimpleName());
+            throw new AIServiceUnavailableException("Gemini is temporarily unavailable");
+        } catch (Exception exception) {
+            LOGGER.warn("Gemini response parsing failure: model={}, cause={}", redact(model), exception.getClass().getSimpleName());
+            throw new AIServiceUnavailableException("Gemini returned an invalid analysis");
+        }
+    }
+
+    private void logProviderError(RestClientResponseException exception) {
+        String code = "UNKNOWN";
+        String status = "UNKNOWN";
+        String message = "Provider returned an unreadable error body";
+        try {
+            JsonNode error = mapper.readTree(exception.getResponseBodyAsString()).path("error");
+            code = error.path("code").asText("UNKNOWN");
+            status = error.path("status").asText("UNKNOWN");
+            if (error.path("message").isTextual()) message = error.path("message").asText();
+        } catch (Exception ignored) {
+            // Never log the raw response, headers, request body, or exception object.
+        }
+        LOGGER.warn("Gemini provider failure: model={}, httpStatus={}, providerCode={}, providerStatus={}, providerMessage={}",
+                redact(model), exception.getStatusCode().value(), redact(code), redact(status), redact(message));
+    }
+
+    private String redact(String value) {
+        if (value == null) return "UNKNOWN";
+        String safe = key.isBlank() ? value : value.replace(key, "[REDACTED]");
+        safe = safe.replaceAll("AIza[A-Za-z0-9_-]{20,}", "[REDACTED]")
+                .replaceAll("[\\p{Cntrl}]", " ");
+        return safe.length() > 2000 ? safe.substring(0, 2000) + " [truncated]" : safe;
     }
 
     private JsonNode parseResult(String text) throws Exception {

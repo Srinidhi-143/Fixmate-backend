@@ -7,6 +7,10 @@ import org.springframework.core.io.ByteArrayResource;
 import org.springframework.http.*;
 import org.springframework.test.web.client.MockRestServiceServer;
 import org.springframework.web.client.RestClient;
+import ch.qos.logback.classic.Logger;
+import ch.qos.logback.classic.spi.ILoggingEvent;
+import ch.qos.logback.core.read.ListAppender;
+import org.slf4j.LoggerFactory;
 import java.util.*;
 import static org.junit.jupiter.api.Assertions.*;
 import static org.springframework.test.web.client.match.MockRestRequestMatchers.*;
@@ -84,8 +88,13 @@ class GeminiClientTest {
         assertThrows(GeminiClient.AIServiceUnavailableException.class, () -> client.analyze("Tap problem", "Other", categories));
     }
     @Test void malformedJsonRejected() {
-        server.expect(anything()).andRespond(withSuccess("{malformed", MediaType.APPLICATION_JSON));
-        assertThrows(GeminiClient.AIServiceUnavailableException.class, () -> client.analyze("Tap problem", "Other", categories));
+        Logger logger = (Logger) LoggerFactory.getLogger(GeminiClient.class);
+        var logs = new ListAppender<ILoggingEvent>(); logs.start(); logger.addAppender(logs);
+        try {
+            server.expect(anything()).andRespond(withSuccess("{malformed", MediaType.APPLICATION_JSON));
+            assertThrows(GeminiClient.AIServiceUnavailableException.class, () -> client.analyze("Tap problem", "Other", categories));
+            assertTrue(logs.list.get(0).getFormattedMessage().contains("Gemini response parsing failure"));
+        } finally { logger.detachAppender(logs); logs.stop(); }
     }
     @Test void missingKeyFailsWithoutNetworkCall() {
         var absent = new GeminiClient(RestClient.create(), mapper, "", "test-model");
@@ -168,6 +177,54 @@ class GeminiClientTest {
     @Test void incompleteCandidateRejected() throws Exception {
         server.expect(anything()).andRespond(withSuccess(envelope(fixture(true)).replace("STOP", "MAX_TOKENS"), MediaType.APPLICATION_JSON));
         assertThrows(GeminiClient.AIServiceUnavailableException.class, () -> client.analyze("Tap", "Other", categories));
+    }
+
+    @Test void providerStatusModelAndUsefulMessageLoggedWithoutKeysOrRawHeaders() throws Exception {
+        Logger logger = (Logger) LoggerFactory.getLogger(GeminiClient.class);
+        var logs = new ListAppender<ILoggingEvent>(); logs.start(); logger.addAppender(logs);
+        try {
+            String anotherKey = "AIza" + "A".repeat(35);
+            String message = "Unsupported response schema; key test-key and " + anotherKey + "\nshould be redacted";
+            String body = mapper.writeValueAsString(Map.of("error", Map.of("code", 400, "status", "INVALID_ARGUMENT", "message", message)));
+            server.expect(anything()).andRespond(withStatus(HttpStatus.BAD_REQUEST).contentType(MediaType.APPLICATION_JSON).body(body));
+            var exception = assertThrows(GeminiClient.AIServiceUnavailableException.class, () -> client.analyze("Tap", "Other", categories));
+            assertEquals("Gemini is temporarily unavailable", exception.getMessage()); assertNull(exception.getCause());
+            String logged = logs.list.get(0).getFormattedMessage();
+            assertTrue(logged.contains("model=test-model")); assertTrue(logged.contains("httpStatus=400"));
+            assertTrue(logged.contains("providerCode=400")); assertTrue(logged.contains("providerStatus=INVALID_ARGUMENT"));
+            assertTrue(logged.contains("Unsupported response schema")); assertTrue(logged.contains("[REDACTED]"));
+            assertFalse(logged.contains("test-key")); assertFalse(logged.contains(anotherKey));
+            assertFalse(logged.contains("x-goog-api-key")); assertFalse(logged.contains("\n"));
+        } finally { logger.detachAppender(logs); logs.stop(); }
+    }
+
+    @Test void eachProviderHttpFailureKeepsExactStatusAndCleanCustomerException() throws Exception {
+        Logger logger = (Logger) LoggerFactory.getLogger(GeminiClient.class);
+        var logs = new ListAppender<ILoggingEvent>(); logs.start(); logger.addAppender(logs);
+        try {
+            for (HttpStatus status : List.of(HttpStatus.UNAUTHORIZED, HttpStatus.FORBIDDEN, HttpStatus.NOT_FOUND,
+                    HttpStatus.TOO_MANY_REQUESTS, HttpStatus.INTERNAL_SERVER_ERROR)) {
+                server.reset(); logs.list.clear();
+                String body = mapper.writeValueAsString(Map.of("error", Map.of("code", status.value(), "status", status.name(), "message", "Provider diagnostic")));
+                server.expect(anything()).andRespond(withStatus(status).contentType(MediaType.APPLICATION_JSON).body(body));
+                var exception = assertThrows(GeminiClient.AIServiceUnavailableException.class, () -> client.analyze("Tap", "Other", categories));
+                assertEquals("Gemini is temporarily unavailable", exception.getMessage());
+                assertTrue(logs.list.get(0).getFormattedMessage().contains("httpStatus=" + status.value()));
+                assertTrue(logs.list.get(0).getFormattedMessage().contains("providerStatus=" + status.name()));
+            }
+        } finally { logger.detachAppender(logs); logs.stop(); }
+    }
+
+    @Test void unreadableProviderBodyIsNeverCopiedIntoLogs() {
+        Logger logger = (Logger) LoggerFactory.getLogger(GeminiClient.class);
+        var logs = new ListAppender<ILoggingEvent>(); logs.start(); logger.addAppender(logs);
+        try {
+            server.expect(anything()).andRespond(withServerError().body("<html>test-key private request body</html>"));
+            assertThrows(GeminiClient.AIServiceUnavailableException.class, () -> client.analyze("Tap", "Other", categories));
+            String logged = logs.list.get(0).getFormattedMessage();
+            assertTrue(logged.contains("httpStatus=500")); assertTrue(logged.contains("unreadable error body"));
+            assertFalse(logged.contains("test-key")); assertFalse(logged.contains("private request body"));
+        } finally { logger.detachAppender(logs); logs.stop(); }
     }
 
     void respondText(String text) throws Exception {
